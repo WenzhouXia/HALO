@@ -11,11 +11,7 @@
   The full camera-ready code release is in preparation.
 
   ## Open-Source Plan
-
-  We plan to release the code in two stages:
-
-  - **2026-03-01**: Initial release of the core HALO framework.
-  - **2026-03-15**: Full open-source release, including complete scripts, configs, and reproducibility materials.
+  - **2026-03**: Full open-source release of the core HALO framework.
 
   Timeline may be adjusted slightly based on the camera-ready process.
 
