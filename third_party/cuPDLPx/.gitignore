@@ -1,0 +1,93 @@
+# 编译相关文件
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+*.exe
+*.out
+
+# 构建目录
+build/
+build_cpp/
+build_cache_*/
+
+# Python相关
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.pytest_cache/
+.hypothesis/
+
+# CMake相关
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+cmake-build-*/
+*.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
+CTestTestfile.cmake
+_deps/
+
+# 编译器相关
+*.swp
+*.bak
+*.tmp
+*~
+
+# IDE相关
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Python包相关
+*.egg-info/
+dist/
+sdist/
+bdist.*/
+.eggs/
+.installed.cfg
+develop-eggs/
+
+# 测试相关
+.pytest_cache/
+.hypothesis/
+.coverage*
+
+# 临时文件
+tmp/
+tmp/**
+*.tmp
+*.temp
+
+# 系统文件
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

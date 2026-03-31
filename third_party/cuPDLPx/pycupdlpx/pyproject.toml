@@ -1,0 +1,13 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12", "numpy"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "pycupdlpx"
+version = "0.0.1"
+description = "Python bindings for cuPDLPx (PDHG-based OT LP solver)"
+authors = [{ name = "xwz" }]
+requires-python = ">=3.8"
+
+[tool.scikit-build]
+wheel.expand-macos-universal-tags = false
