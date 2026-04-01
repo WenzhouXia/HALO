@@ -26,6 +26,14 @@ def _child_labels_for_resolution(resolution: int) -> np.ndarray:
     coarse_res = res // 2
     return ((fine_i // 2) * coarse_res + (fine_j // 2)).astype(np.int32, copy=False)
 
+def _adaptive_num_scales(resolution: int, min_coarsest_resolution: int = 16) -> int:
+    scales = 0
+    current = int(resolution)
+    while current % 2 == 0 and current // 2 >= int(min_coarsest_resolution):
+        current //= 2
+        scales += 1
+    return scales
+
 class GridHierarchy(BaseHierarchy):
     
 
@@ -46,9 +54,14 @@ class GridHierarchy(BaseHierarchy):
         self.original_shape = tuple(hist.shape)
         levels_hist: List[np.ndarray] = [hist]
         max_scales = 0
+        target_num_scales = (
+            _adaptive_num_scales(int(hist.shape[0]))
+            if self.num_scales is None
+            else int(self.num_scales)
+        )
         curr = hist
         while curr.shape[0] > 1 and curr.shape[0] % 2 == 0:
-            if self.num_scales is not None and max_scales >= int(self.num_scales):
+            if max_scales >= target_num_scales:
                 break
             curr = _coarsen_histogram(curr)
             levels_hist.append(curr)

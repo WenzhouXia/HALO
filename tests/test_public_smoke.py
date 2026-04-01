@@ -4,6 +4,7 @@ import numpy as np
 
 from halo_public import HALOConfig, MGPDConfig, solve_halo, solve_mgpd
 from halo_public.halo import solve as halo_solve
+from halo_public.mgpd.hierarchy import GridHierarchy
 from halo_public.mgpd import solve as mgpd_solve
 
 try:
@@ -36,6 +37,14 @@ def test_mgpd_smoke() -> None:
     assert np.isfinite(float(out["distance"]))
     assert out["level_summaries"]
     assert out["solver_mode"] == "grid"
+
+
+def test_mgpd_adaptive_default_stops_at_16x16() -> None:
+    hist = _make_hist(10, resolution=256)
+    hierarchy = GridHierarchy(num_scales=None)
+    hierarchy.build(hist)
+    assert hierarchy.num_levels == 5
+    assert hierarchy.levels[-1].points.shape[0] == 16 * 16
 
 
 def test_halo_smoke_and_l1() -> None:
