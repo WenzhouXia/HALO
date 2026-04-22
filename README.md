@@ -1,58 +1,64 @@
 # HALO_public
 
-`HALO_public` is a minimal public package extracted from `hierarchical_ot` with two public algorithm entry points:
+[English](README.md) | [简体中文](README.zh.md)
 
-- `MGPD`: grid-based OT, exposed as `halo_public.mgpd.solve`
-- `HALO`: point-cloud OT, exposed as `halo_public.halo.solve`
+`HALO_public` is the public tree/grid subset rebuilt from `hierarchical_ot`.
 
-The repository ships with the `scipy` LP backend by default to keep the package runnable out of the box. GPU-related dependencies are provided separately through optional extras.
+It exposes the installable runtime for hierarchical optimal transport together with a small set of runnable examples.
 
-## Install
+## Core Solver Flow
 
-```bash
-pip install -e .
-```
+The main multilevel algorithm is implemented in `src/hierarchical_ot/core/multilevel_flow.py`.
 
+At a high level, the solver runs the following loop:
 
+1. Validate the problem definition and initialize run-level state.
+2. Build a coarse-to-fine list of hierarchy levels.
+3. For each level, initialize mode-specific state and active support.
+4. Repeatedly prepare the current subproblem, solve one LP step, finalize the iteration, and check stopping criteria.
+5. Record the current level result and propagate warm-start information to the next finer level.
+6. After the finest level finishes, package the final transport result and profiling output.
 
-## Usage
+This is the core idea behind the library: solve a sequence of progressively finer OT problems, using the coarse solution to warm-start the fine one.
 
-Below are typical usage examples for the two public algorithm entry points built on top of the unified framework.
+## Modes
 
-MGPD:
+`grid` mode is for 2D Cartesian grids.
+Typical use case: image-like histograms on regular 2D lattices.
 
-```python
-import numpy as np
-from halo_public import MGPDConfig, solve_mgpd
+`tree` mode is for low-dimensional point clouds, especially 2D and 3D point clouds.
+It is also the mode used by the provided free-support Wasserstein barycenter examples.
 
-source = np.ones((8, 8), dtype=np.float32)
-target = np.eye(8, dtype=np.float32)
-out = solve_mgpd(source, target, MGPDConfig(num_scales=2, max_inner_iter=2))
-print(out["distance"])
-```
+## Examples
 
-HALO:
-
-```python
-import numpy as np
-from halo_public import HALOConfig, solve_halo
-
-rng = np.random.default_rng(0)
-xs = rng.normal(size=(32, 2)).astype(np.float32)
-xt = rng.normal(size=(32, 2)).astype(np.float32)
-out = solve_halo(xs, xt, config=HALOConfig(max_inner_iter=2, cost_type="l2^2"))
-print(out["distance"])
-```
-
-## Public API
-
-- `halo_public.MGPDConfig`
-- `halo_public.solve_mgpd`
-- `halo_public.HALOConfig`
-- `halo_public.solve_halo`
-
-## Tests
+Run:
 
 ```bash
-python -m pytest tests/test_public_smoke.py
+bash examples/run_examples.sh
 ```
+
+This script runs the public examples directly:
+
+- `examples/test_grid_mode.py`: a basic 2D grid-mode example
+- `examples/test_tree_mode.py`: a basic tree-mode example
+- `examples/show_tree_pairwise_barycenter.py --dimension 2`: 2D free-support Wasserstein barycenter
+- `examples/show_tree_pairwise_barycenter.py --dimension 3`: 3D free-support Wasserstein barycenter
+
+These barycenter scripts are intended as downstream applications built on top of the exported OT solver.
+
+## Export Policy
+
+- Keep the installable tree/grid runtime and APIs
+- Exclude cluster mode, dual-assignment, gromov, and low-rank research paths
+- Overwrite shared entrypoints with public-only overlays so the package imports cleanly
+- Export runnable public examples under `examples/`
+
+The export script also writes:
+
+- `EXPORT_MANIFEST.json`: copied files, overlays, and exclusion policy
+- `EXPORT_AUDIT.md`: forbidden-path / forbidden-text audit results
+
+## Example-Only Dependencies
+
+- `matplotlib` and `POT` are needed for the barycenter visualization example
+- The 3D barycenter example uses pre-sampled ModelNet10 chair/toilet assets bundled under `examples/assets/`

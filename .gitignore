@@ -1,4 +1,52 @@
+# Python caches
 __pycache__/
 *.py[cod]
-*.nbc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.ipynb_checkpoints/
+
+# Coverage and test artifacts
+.coverage
+.coverage.*
+htmlcov/
+
+# Packaging artifacts
+build/
+dist/
+site/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Native/CMake/Ninja build outputs
+*.so
+*.dylib
+*.dll
+*.o
+*.obj
+*.a
+*.lib
+*.exp
+*.pdb
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+build.ninja
+.ninja_deps
+.ninja_log
+
+# Numba caches
 *.nbi
+*.nbc
+
+# Example/runtime outputs
+examples/outputs/
