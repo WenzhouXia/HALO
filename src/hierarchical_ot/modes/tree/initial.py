@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any, Dict, Tuple
 
 import numpy as np
@@ -10,6 +11,7 @@ from ...types.runtime import LevelState
 from .logger import tree_log
 from .solve_lp import _solve_lp
 from .shielding import build_active_set_first_iter, build_active_set_subsequent_iter
+from .trace_utils import tree_trace_span
 
 
 def _build_sparse_coupling(keep: np.ndarray, values: np.ndarray, *, n_target: int) -> Dict[str, np.ndarray] | None:
@@ -42,7 +44,7 @@ def should_exact_flat(solver) -> bool:
     return int(len(finest_s.points)) <= 256 and int(len(finest_t.points)) <= 256
 
 
-def solve_exact_flat(solver, tolerance):
+def solve_exact_flat(solver, tolerance, *, trace_collector=None, trace_prefix: str = "solve_ot"):
     level_s = solver.hierarchy_s.finest_level
     level_t = solver.hierarchy_t.finest_level
     n_s = int(len(level_s.points))
@@ -59,20 +61,35 @@ def solve_exact_flat(solver, tolerance):
     x_init = np.zeros(n_s + n_t, dtype=np.float64)
     y_init = np.zeros(len(keep), dtype=np.float64)
 
-    lp_result = _solve_lp(
-        solver,
-        level_s=level_s,
-        level_t=level_t,
-        keep_coord=keep_coord,
-        x_init=x_init,
-        y_init=y_init,
-        stop_thr=stop_thr,
-        inner_iter=0,
-        prev_PrimalFeas=None,
+    with tree_trace_span(
+        trace_collector,
+        "tree.lp.single_level_exact",
         level_idx=0,
-        is_coarsest=False,
-        tree_debug=bool(getattr(solver, "tree_debug", False)),
-    )
+        inner_iter=0,
+        stage="single_level_exact",
+        args={"n_source": int(n_s), "n_target": int(n_t)},
+    ):
+        lp_result = _solve_lp(
+            solver,
+            level_s=level_s,
+            level_t=level_t,
+            keep_coord=keep_coord,
+            x_init=x_init,
+            y_init=y_init,
+            stop_thr=stop_thr,
+            inner_iter=0,
+            prev_PrimalFeas=None,
+            level_idx=0,
+            is_coarsest=False,
+            tree_debug=bool(getattr(solver, "tree_debug", False)),
+            trace_collector=trace_collector,
+            trace_prefix=trace_prefix,
+            trace_context={
+                "level_idx": 0,
+                "inner_iter": 0,
+                "stage": "single_level_exact",
+            },
+        )
     if lp_result.get("diag"):
         solver.tree_lp_diags.append(lp_result["diag"])
     if not lp_result.get("success", False):
@@ -237,6 +254,8 @@ def tree_prepare_inner(
     check_method: str,
     inner_iter: int,
     sampled_config=None,
+    trace_collector=None,
+    trace_prefix: str = "solve_ot",
 ) -> Dict[str, Any]:
     n_s = len(level_s.points)
     n_t = len(level_t.points)
@@ -258,6 +277,13 @@ def tree_prepare_inner(
             vd_thr=vd_thr,
             check_method=check_method,
             sampled_config=sampled_config,
+            trace_collector=trace_collector,
+            trace_prefix=trace_prefix,
+            trace_context={
+                "level_idx": level_idx,
+                "inner_iter": inner_iter,
+                "stage": "init_active_set",
+            },
         )
     else:
         init_result = build_active_set_subsequent_iter(
@@ -275,6 +301,13 @@ def tree_prepare_inner(
             check_method=check_method,
             inner_iter=inner_iter,
             sampled_config=sampled_config,
+            trace_collector=trace_collector,
+            trace_prefix=trace_prefix,
+            trace_context={
+                "level_idx": level_idx,
+                "inner_iter": inner_iter,
+                "stage": "init_active_set",
+            },
         )
 
     if init_result.get("prepare_breakdown"):
@@ -365,9 +398,12 @@ def init_run_state(solver, tolerance, **kwargs):
         "ifcheck": ifcheck,
         "vd_thr": vd_thr,
         "check_method": check_method,
+        "sampled_config": kwargs.get("sampled_config", getattr(solver, "check_sampled_config", None)),
         "x_solution_last": None,
         "y_solution_last": None,
         "tolerance": tolerance,
+        "trace_collector": kwargs.get("trace_collector"),
+        "trace_prefix": str(kwargs.get("trace_prefix", "solve_ot")),
     }
 
 
@@ -424,6 +460,9 @@ def init_level_state(solver, level_idx, run_state, tolerance, cost_type, _use_bf
         vd_thr=run_state["vd_thr"],
         check_method=run_state["check_method"],
         inner_iter=0,
+        sampled_config=run_state.get("sampled_config"),
+        trace_collector=run_state.get("trace_collector"),
+        trace_prefix=run_state.get("trace_prefix", "solve_ot"),
     )
     state["keep"] = prep0["keep"]
     state["keep_coord"] = prep0["keep_coord"]

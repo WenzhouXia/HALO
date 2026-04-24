@@ -759,6 +759,7 @@
     "src/hierarchical_ot/modes/tree/shielding_backup.py",
     "src/hierarchical_ot/modes/tree/solve_lp.py",
     "src/hierarchical_ot/modes/tree/stop.py",
+    "src/hierarchical_ot/modes/tree/trace_utils.py",
     "src/hierarchical_ot/modes/tree/violation_check.py",
     "src/hierarchical_ot/solvers/__init__.py",
     "src/hierarchical_ot/solvers/single_level.py",

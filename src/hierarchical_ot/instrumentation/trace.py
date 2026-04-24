@@ -31,7 +31,7 @@ class _ChromeTraceCollector:
         return _ChromeTraceCollector(
             enabled=bool(self.enabled),
             pid=int(self.pid),
-            tid=int(self.tid if tid is None else tid),
+            tid=int(self.tid),
             start_time=float(self.start_time),
             events=self.events,
             name_prefix=combined_prefix,
@@ -63,7 +63,7 @@ class _ChromeTraceCollector:
                     "cat": str(category),
                     "ph": "X",
                     "pid": int(self.pid),
-                    "tid": int(self.tid if tid is None else tid),
+                    "tid": int(self.tid),
                     "ts": float((t0 - self.start_time) * 1e6),
                     "dur": float(max(t1 - t0, 0.0) * 1e6),
                     "args": dict(args or {}),

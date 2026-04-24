@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import json
 from contextlib import nullcontext
 from typing import Any, Dict, Literal, Optional, Sequence, Set, Tuple
 
@@ -150,6 +151,7 @@ def _finalize_emd_output(
     lp_solve_time_total: float,
     elapsed: float,
     extra_log_fields: Optional[Dict[str, Any]] = None,
+    chrome_trace: Optional[Dict[str, Any]] = None,
     log: bool,
     return_coupling: bool,
     return_state: bool,
@@ -168,6 +170,8 @@ def _finalize_emd_output(
             log_dict.update(extra_log_fields)
         if profiling is not None:
             log_dict["profiling"] = profiling
+        if chrome_trace is not None:
+            log_dict["chrome_trace"] = chrome_trace
         return log_dict
 
     if return_coupling and return_state:
@@ -177,6 +181,35 @@ def _finalize_emd_output(
     if return_state:
         return float(distance), state
     return float(distance)
+
+
+def _build_trace_collector_from_config(
+    config: ConfigType,
+    *,
+    trace_prefix: str = "solve_ot",
+) -> Optional[_ChromeTraceCollector]:
+    profiling_cfg = config.normalized_profiling()
+    if not bool(profiling_cfg.get("write_trace_json", False)):
+        return None
+    del trace_prefix
+    return _ChromeTraceCollector(enabled=True)
+
+
+def _write_trace_json_if_requested(
+    config: ConfigType,
+    *,
+    chrome_trace: Optional[Dict[str, Any]],
+) -> None:
+    if chrome_trace is None:
+        return
+    profiling_cfg = config.normalized_profiling()
+    if not bool(profiling_cfg.get("write_trace_json", False)):
+        return
+    raw_path = profiling_cfg.get("trace_json_path")
+    trace_json_path = os.path.abspath(str(raw_path)) if raw_path is not None else os.path.abspath("chrome_trace.json")
+    os.makedirs(os.path.dirname(trace_json_path), exist_ok=True)
+    with open(trace_json_path, "w", encoding="utf-8") as fh:
+        json.dump(chrome_trace, fh)
 
 
 def _materialize_grid_ot_return(

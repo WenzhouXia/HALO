@@ -4,6 +4,7 @@ Constraint Violation Check (HALO 迁移)
 检测当前 dual solution 是否有违反约束的边被遗漏。
 """
 
+from contextlib import nullcontext
 import numpy as np
 import logging
 try:
@@ -15,6 +16,7 @@ except ImportError:
 from typing import Tuple, Optional, Literal, Dict, Any
 
 from .logger import tree_log
+from .trace_utils import tree_trace_span
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +46,10 @@ def check_constraint_violations(
     max_keep: Optional[int] = None,
     method: Literal['cpu', 'gpu', 'gpu_approx', 'auto', 'cupy'] = 'auto',
     sampled_config: Optional[Dict[str, Any]] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+    trace_collector=None,
+    trace_prefix: str = "solve_ot.violation",
+    trace_context: Optional[Dict[str, Any]] = None,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     """
     CN: 按指定方法检查当前 tree dual 解中的约束违反并返回违反边及其 slack。
     EN: Check constraint violations in the current tree dual solution and return violating edges with their slack.
@@ -62,17 +67,33 @@ def check_constraint_violations(
     elif method_norm in {"gpu", "gpu_full", "full_gpu"}:
         method_norm = "gpu"
 
+    trace_meta = dict(trace_context or {})
+    trace_level = trace_meta.get("level_idx")
+    trace_iter = trace_meta.get("inner_iter")
+    trace_stage = trace_meta.get("stage", "post_lp_pricing")
+
     # 选择方法
-    if method_norm == 'auto':
-        if HAS_CUPY and n_s * n_t > 1_000_000:
-            method_norm = 'gpu_approx'
-        else:
-            method_norm = 'cpu'
+    with tree_trace_span(
+        trace_collector,
+        "tree.violation.method_select",
+        level_idx=trace_level,
+        inner_iter=trace_iter,
+        stage=trace_stage,
+        args={"method_requested": str(method), "n_source": int(n_s), "n_target": int(n_t)},
+    ):
+        if method_norm == 'auto':
+            if HAS_CUPY and n_s * n_t > 1_000_000:
+                method_norm = 'gpu_approx'
+            else:
+                method_norm = 'cpu'
 
     if method_norm == 'gpu' and HAS_CUPY:
-        return _check_violations_cupy_full(u, v, level_s, level_t, cost_type, p, eps, max_keep)
-    if method_norm == 'gpu_approx' and HAS_CUPY:
-        return _check_violations_cupy_sampled(
+        keep, slack = _check_violations_cupy_full(
+            u, v, level_s, level_t, cost_type, p, eps, max_keep,
+            trace_collector=trace_collector, trace_prefix=trace_prefix, trace_context=trace_context,
+        )
+    elif method_norm == 'gpu_approx' and HAS_CUPY:
+        keep, slack = _check_violations_cupy_sampled(
             u=u,
             v=v,
             level_s=level_s,
@@ -82,8 +103,23 @@ def check_constraint_violations(
             eps=eps,
             max_keep=max_keep,
             sampled_config=sampled_config,
+            trace_collector=trace_collector,
+            trace_prefix=trace_prefix,
+            trace_context=trace_context,
         )
-    return _check_violations_cpu(u, v, level_s, level_t, cost_type, p, eps, max_keep)
+    else:
+        keep, slack = _check_violations_cpu(
+            u, v, level_s, level_t, cost_type, p, eps, max_keep,
+            trace_collector=trace_collector, trace_prefix=trace_prefix, trace_context=trace_context,
+        )
+    meta = {
+        "method_used": method_norm,
+        "n_source": int(n_s),
+        "n_target": int(n_t),
+        "violating_edges_found": int(len(keep)),
+        "violating_edges_kept": int(len(keep)),
+    }
+    return keep, slack, meta
 
 
 def _check_violations_cpu(
@@ -95,6 +131,9 @@ def _check_violations_cpu(
     p: float,
     eps: float,
     max_keep: Optional[int],
+    trace_collector=None,
+    trace_prefix: str = "solve_ot.violation",
+    trace_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     CN: 在 CPU 上精确计算违反边，并按 slack 从大到小返回 top-K。
@@ -104,19 +143,27 @@ def _check_violations_cpu(
     Y = np.asarray(level_t.points, dtype=np.float32)
     n_t = Y.shape[0]
 
-    diff = X[:, None, :] - Y[None, :, :]
-    cost_type_upper = _normalize_cost_type(cost_type)
-    if cost_type_upper in ("L2", "SQEUCLIDEAN"):
-        C = np.sum(diff * diff, axis=2)
-    elif cost_type_upper == "L1":
-        C = np.sum(np.abs(diff), axis=2)
-    elif cost_type_upper == "LINF":
-        C = np.max(np.abs(diff), axis=2)
-    else:
-        raise NotImplementedError(f"Unsupported cost_type={cost_type}")
+    trace_meta = dict(trace_context or {})
+    with tree_trace_span(
+        trace_collector,
+        "tree.violation.cost_slack",
+        level_idx=trace_meta.get("level_idx"),
+        inner_iter=trace_meta.get("inner_iter"),
+        stage=trace_meta.get("stage", "post_lp_pricing"),
+    ):
+        diff = X[:, None, :] - Y[None, :, :]
+        cost_type_upper = _normalize_cost_type(cost_type)
+        if cost_type_upper in ("L2", "SQEUCLIDEAN"):
+            C = np.sum(diff * diff, axis=2)
+        elif cost_type_upper == "L1":
+            C = np.sum(np.abs(diff), axis=2)
+        elif cost_type_upper == "LINF":
+            C = np.max(np.abs(diff), axis=2)
+        else:
+            raise NotImplementedError(f"Unsupported cost_type={cost_type}")
 
-    slack = u[:, None] + v[None, :] - C
-    mask = slack > eps
+        slack = u[:, None] + v[None, :] - C
+        mask = slack > eps
     if not np.any(mask):
         return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32)
 
@@ -124,12 +171,19 @@ def _check_violations_cpu(
     slack_pos = slack[idx_i, idx_j].astype(np.float32, copy=False)
     keep_1d = idx_i.astype(np.int64) * np.int64(n_t) + idx_j.astype(np.int64)
 
-    if max_keep is not None and slack_pos.size > max_keep:
-        top_idx = np.argpartition(-slack_pos, max_keep - 1)[:max_keep]
-        keep_1d = keep_1d[top_idx]
-        slack_pos = slack_pos[top_idx]
+    with tree_trace_span(
+        trace_collector,
+        "tree.violation.topk_sort",
+        level_idx=trace_meta.get("level_idx"),
+        inner_iter=trace_meta.get("inner_iter"),
+        stage=trace_meta.get("stage", "post_lp_pricing"),
+    ):
+        if max_keep is not None and slack_pos.size > max_keep:
+            top_idx = np.argpartition(-slack_pos, max_keep - 1)[:max_keep]
+            keep_1d = keep_1d[top_idx]
+            slack_pos = slack_pos[top_idx]
 
-    order = np.argsort(-slack_pos)
+        order = np.argsort(-slack_pos)
     return keep_1d[order], slack_pos[order]
 
 
@@ -142,6 +196,9 @@ def _check_violations_cupy_full(
     p: float,
     eps: float,
     max_keep: Optional[int],
+    trace_collector=None,
+    trace_prefix: str = "solve_ot.violation",
+    trace_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     CN: 在 GPU 上全量精确检查 tree 约束违反。
@@ -153,32 +210,39 @@ def _check_violations_cupy_full(
     n_s = len(u)
     n_t = len(v)
     
-    # 移动到 GPU
-    u_gpu = cp.asarray(u)
-    v_gpu = cp.asarray(v)
-    X_gpu = cp.asarray(level_s.points)
-    Y_gpu = cp.asarray(level_t.points)
-    
-    # 计算成本矩阵 (n_s, n_t)
-    # 使用广播: (n_s, 1, dim) - (1, n_t, dim) = (n_s, n_t, dim)
-    diff = X_gpu[:, None, :] - Y_gpu[None, :, :]
-    
-    cost_type_upper = _normalize_cost_type(cost_type)
-    if cost_type_upper in ('L2', 'SQEUCLIDEAN'):
-        C_gpu = cp.sum(diff ** 2, axis=2)
-    elif cost_type_upper == 'L1':
-        C_gpu = cp.sum(cp.abs(diff), axis=2)
-    elif cost_type_upper == 'LINF':
-        C_gpu = cp.max(cp.abs(diff), axis=2)
-    else:
-        C_gpu = cp.sum(diff ** 2, axis=2)
-    
-    # 计算约束: u + v^T - C > eps
-    lhs = u_gpu[:, None] + v_gpu[None, :]
-    rhs = C_gpu + eps
-    
-    # 找出违反
-    violate_mask = lhs > rhs
+    trace_meta = dict(trace_context or {})
+    with tree_trace_span(
+        trace_collector,
+        "tree.violation.gpu_upload",
+        level_idx=trace_meta.get("level_idx"),
+        inner_iter=trace_meta.get("inner_iter"),
+        stage=trace_meta.get("stage", "post_lp_pricing"),
+    ):
+        u_gpu = cp.asarray(u)
+        v_gpu = cp.asarray(v)
+        X_gpu = cp.asarray(level_s.points)
+        Y_gpu = cp.asarray(level_t.points)
+
+    with tree_trace_span(
+        trace_collector,
+        "tree.violation.gpu_kernel",
+        level_idx=trace_meta.get("level_idx"),
+        inner_iter=trace_meta.get("inner_iter"),
+        stage=trace_meta.get("stage", "post_lp_pricing"),
+    ):
+        diff = X_gpu[:, None, :] - Y_gpu[None, :, :]
+        cost_type_upper = _normalize_cost_type(cost_type)
+        if cost_type_upper in ('L2', 'SQEUCLIDEAN'):
+            C_gpu = cp.sum(diff ** 2, axis=2)
+        elif cost_type_upper == 'L1':
+            C_gpu = cp.sum(cp.abs(diff), axis=2)
+        elif cost_type_upper == 'LINF':
+            C_gpu = cp.max(cp.abs(diff), axis=2)
+        else:
+            C_gpu = cp.sum(diff ** 2, axis=2)
+        lhs = u_gpu[:, None] + v_gpu[None, :]
+        rhs = C_gpu + eps
+        violate_mask = lhs > rhs
     
     if not cp.any(violate_mask):
         return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32)
@@ -206,8 +270,16 @@ def _check_violations_cupy_full(
     keep_1d = keep_1d[order]
     slack = slack[order]
 
-    # 转回 CPU
-    return cp.asnumpy(keep_1d), cp.asnumpy(slack)
+    with tree_trace_span(
+        trace_collector,
+        "tree.violation.gpu_download",
+        level_idx=trace_meta.get("level_idx"),
+        inner_iter=trace_meta.get("inner_iter"),
+        stage=trace_meta.get("stage", "post_lp_pricing"),
+    ):
+        keep_cpu = cp.asnumpy(keep_1d)
+        slack_cpu = cp.asnumpy(slack)
+    return keep_cpu, slack_cpu
 
 
 def check_constraint_violations_sampled_adaptive_submatrix(
@@ -352,6 +424,9 @@ def _check_violations_cupy_sampled(
     eps: float,
     max_keep: Optional[int],
     sampled_config: Optional[Dict[str, Any]],
+    trace_collector=None,
+    trace_prefix: str = "solve_ot.violation",
+    trace_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     CN: 封装基于 CuPy 采样近似的 violation 检查流程并处理资源释放。
@@ -373,19 +448,46 @@ def _check_violations_cupy_sampled(
     seed = int(cfg.get("seed", 42))
 
     try:
-        keep_add, slack_arr = check_constraint_violations_sampled_adaptive_submatrix(
-            x_solution=np.concatenate([u, v]),
-            nodes_X=np.asarray(level_s.points, dtype=np.float32),
-            nodes_Y=np.asarray(level_t.points, dtype=np.float32),
-            max_keep=max_keep_local,
-            eps=eps,
-            cost_type=cost_type,
-            p=int(p),
-            n_X_batch=n_X_batch,
-            n_Y_batch=n_Y_batch,
-            max_batches=max_batches,
-            seed=seed,
-        )
+        trace_meta = dict(trace_context or {})
+        with tree_trace_span(
+            trace_collector,
+            "tree.violation.gpu_upload",
+            level_idx=trace_meta.get("level_idx"),
+            inner_iter=trace_meta.get("inner_iter"),
+            stage=trace_meta.get("stage", "post_lp_pricing"),
+        ):
+            x_solution = np.concatenate([u, v])
+            nodes_X = np.asarray(level_s.points, dtype=np.float32)
+            nodes_Y = np.asarray(level_t.points, dtype=np.float32)
+        with tree_trace_span(
+            trace_collector,
+            "tree.violation.gpu_kernel",
+            level_idx=trace_meta.get("level_idx"),
+            inner_iter=trace_meta.get("inner_iter"),
+            stage=trace_meta.get("stage", "post_lp_pricing"),
+        ):
+            keep_add, slack_arr = check_constraint_violations_sampled_adaptive_submatrix(
+                x_solution=x_solution,
+                nodes_X=nodes_X,
+                nodes_Y=nodes_Y,
+                max_keep=max_keep_local,
+                eps=eps,
+                cost_type=cost_type,
+                p=int(p),
+                n_X_batch=n_X_batch,
+                n_Y_batch=n_Y_batch,
+                max_batches=max_batches,
+                seed=seed,
+            )
+        with tree_trace_span(
+            trace_collector,
+            "tree.violation.gpu_download",
+            level_idx=trace_meta.get("level_idx"),
+            inner_iter=trace_meta.get("inner_iter"),
+            stage=trace_meta.get("stage", "post_lp_pricing"),
+        ):
+            keep_add = np.asarray(keep_add, dtype=np.int64)
+            slack_arr = np.asarray(slack_arr, dtype=np.float32)
         return keep_add, slack_arr
     except Exception as exc:
         raise RuntimeError(
@@ -456,13 +558,24 @@ def apply_violation_check(solver, **kwargs):
     vd_thr = kwargs["vd_thr"]
     check_method = kwargs["check_method"]
     sampled_config = kwargs.get("sampled_config")
+    trace_collector = kwargs.get("trace_collector")
+    trace_prefix = str(kwargs.get("trace_prefix", "solve_ot.violation"))
+    trace_context = dict(kwargs.get("trace_context", {}))
+    return_meta = bool(kwargs.get("return_meta", False))
     if not ifcheck:
-        return keep
+        meta = {
+            "method_used": "disabled",
+            "n_source": int(len(level_s.points)),
+            "n_target": int(len(level_t.points)),
+            "violating_edges_found": 0,
+            "violating_edges_kept": 0,
+        }
+        return (keep, meta) if return_meta else keep
 
     n_s = len(level_s.points)
     n_t = len(level_t.points)
     max_keep = int(vd_thr * (n_s + n_t)) if vd_thr is not None else None
-    violation_keep, _ = check_constraint_violations(
+    violation_keep, _, meta = check_constraint_violations(
         x_dual,
         level_s,
         level_t,
@@ -471,10 +584,13 @@ def apply_violation_check(solver, **kwargs):
         max_keep=max_keep,
         method=check_method,
         sampled_config=sampled_config,
+        trace_collector=trace_collector,
+        trace_prefix=trace_prefix,
+        trace_context=trace_context,
     )
     if violation_keep.size == 0:
         tree_log(solver, "    [Check] found: 0")
-        return keep
+        return (keep, meta) if return_meta else keep
 
     if keep.size > 0:
         new_mask = ~np.isin(violation_keep, keep)
@@ -484,9 +600,26 @@ def apply_violation_check(solver, **kwargs):
 
     if violation_new.size == 0:
         tree_log(solver, f"    [Check] found: {len(violation_keep)} (all already in active set)")
-        return keep
+        meta["violating_edges_kept"] = 0
+        return (keep, meta) if return_meta else keep
 
     keep_new = np.unique(np.concatenate([keep, violation_new.astype(np.int64)]))
+    meta["violating_edges_kept"] = int(len(violation_new))
     tree_log(solver, f"    [Check] found: {len(violation_keep)} ({len(violation_new)} new)")
     tree_log(solver, f"    [Check] expanding active set: {len(keep)} -> {len(keep_new)}")
-    return keep_new
+    with tree_trace_span(
+        trace_collector,
+        "tree.violation.host_return",
+        level_idx=trace_context.get("level_idx"),
+        inner_iter=trace_context.get("inner_iter"),
+        stage=trace_context.get("stage", "post_lp_pricing"),
+        args={
+            "method_used": meta["method_used"],
+            "violating_edges_found": int(meta["violating_edges_found"]),
+            "violating_edges_kept": int(meta["violating_edges_kept"]),
+            "active_before": int(len(keep)),
+            "active_after": int(len(keep_new)),
+        },
+    ):
+        pass
+    return (keep_new, meta) if return_meta else keep_new

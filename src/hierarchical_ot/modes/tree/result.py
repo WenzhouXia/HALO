@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import numpy as np
 
 from ...core.result_utils import build_objective_history_by_level
@@ -36,6 +37,49 @@ def _build_sparse_coupling_from_primal(primal: dict | None, *, n_target: int) ->
         "cols": cols,
         "values": values_nz.astype(np.float32, copy=False),
     }
+
+
+def _compute_final_obj_from_sparse_coupling(
+    sparse_coupling: dict[str, np.ndarray] | None,
+    *,
+    source_points: np.ndarray,
+    target_points: np.ndarray,
+    cost_type: str,
+    p: float,
+) -> float:
+    if not isinstance(sparse_coupling, dict):
+        return 0.0
+
+    rows = np.asarray(sparse_coupling.get("rows", []), dtype=np.int64).ravel()
+    cols = np.asarray(sparse_coupling.get("cols", []), dtype=np.int64).ravel()
+    values = np.asarray(sparse_coupling.get("values", []), dtype=np.float64).ravel()
+    if rows.size == 0 or cols.size == 0 or values.size == 0:
+        return 0.0
+    if rows.shape != cols.shape or rows.shape != values.shape:
+        raise ValueError(
+            "Tree sparse coupling rows/cols/values shape mismatch when computing final_obj: "
+            f"{rows.shape}, {cols.shape}, {values.shape}"
+        )
+
+    src = np.asarray(source_points, dtype=np.float64)[rows]
+    tgt = np.asarray(target_points, dtype=np.float64)[cols]
+    diff = src - tgt
+
+    cost_name = str(cost_type).strip().lower()
+    if cost_name in {"l2^2", "sqeuclidean", "l2sq"}:
+        costs = np.einsum("ij,ij->i", diff, diff, optimize=True)
+    elif cost_name == "l2":
+        costs = np.sqrt(np.einsum("ij,ij->i", diff, diff, optimize=True))
+    elif cost_name == "l1":
+        costs = np.sum(np.abs(diff), axis=1)
+    elif cost_name == "linf":
+        costs = np.max(np.abs(diff), axis=1)
+    elif cost_name == "lp":
+        costs = np.sum(np.abs(diff) ** float(p), axis=1)
+    else:
+        costs = np.einsum("ij,ij->i", diff, diff, optimize=True)
+
+    return float(np.dot(values, costs.astype(np.float64, copy=False)))
 
 
 def record_level(problem_def, algorithm_state, level_state) -> None:
@@ -80,56 +124,56 @@ def advance_level(problem_def, algorithm_state, level_state) -> None:
 def package_result(problem_def, algorithm_state):
     del algorithm_state
     solver = problem_def.solver
-    final_sol = solver.solutions[0]
-    final_obj = 0.0
-    level_0 = solver.hierarchy_s.levels[0]
-    level_0_t = solver.hierarchy_t.levels[0]
-    primal = final_sol.get("primal")
-    sparse_coupling = _build_sparse_coupling_from_primal(
-        primal,
-        n_target=len(level_0_t.points),
-    )
-    cost_type_raw = str(getattr(solver, "_cost_type", "l2^2")).strip().lower()
-    if cost_type_raw in {"l2^2", "sqeuclidean", "l2sq"}:
-        cost_type = "L2"
-    elif cost_type_raw == "l1":
-        cost_type = "L1"
-    elif cost_type_raw == "linf":
-        cost_type = "LINF"
-    else:
-        cost_type = "L2"
+    trace_collector = getattr(problem_def, "trace_collector", None)
+    trace_prefix = str(getattr(problem_def, "trace_prefix", "solve_ot"))
 
-    if primal is not None and "y" in primal and "keep" in primal:
-        y_vals = primal["y"]
-        keep = primal["keep"]
-        n_t = len(level_0_t.points)
-        for idx, y_val in zip(keep, y_vals):
-            flow = abs(float(y_val))
-            if flow <= 0.0:
-                continue
-            i = idx // n_t
-            j = idx % n_t
-            diff = level_0.points[i] - level_0_t.points[j]
-            if cost_type == "L2":
-                cost = np.sum(diff ** 2)
-            elif cost_type == "L1":
-                cost = np.sum(np.abs(diff))
-            elif cost_type == "LINF":
-                cost = np.max(np.abs(diff))
-            else:
-                cost = np.sum(diff ** 2)
-            final_obj += flow * cost
+    def _trace_span(name: str, args=None):
+        if trace_collector is None:
+            return nullcontext()
+        return trace_collector.span(
+            f"{trace_prefix}.solve.package_result.{name}",
+            "solve_ot",
+            args=dict(args or {}),
+        )
 
-    return {
-        "primal": final_sol.get("primal"),
-        "dual": final_sol.get("dual"),
-        "final_obj": final_obj,
-        "all_history": solver.solutions,
-        "objective_history_by_level": build_objective_history_by_level(solver.solutions),
-        "sparse_coupling": sparse_coupling,
-        "level_summaries": solver.level_summaries,
-        "lp_solve_time_total": float(
+    with _trace_span("final_solution"):
+        final_sol = solver.solutions[0]
+        level_0 = solver.hierarchy_s.levels[0]
+        level_0_t = solver.hierarchy_t.levels[0]
+        primal = final_sol.get("primal")
+
+    with _trace_span("sparse_coupling"):
+        sparse_coupling = _build_sparse_coupling_from_primal(
+            primal,
+            n_target=len(level_0_t.points),
+        )
+
+    with _trace_span("final_obj"):
+        final_obj = _compute_final_obj_from_sparse_coupling(
+            sparse_coupling,
+            source_points=np.asarray(level_0.points, dtype=np.float64),
+            target_points=np.asarray(level_0_t.points, dtype=np.float64),
+            cost_type=str(getattr(solver, "_cost_type", "l2^2")),
+            p=float(getattr(solver, "_cost_p", 2.0)),
+        )
+
+    with _trace_span("objective_history"):
+        objective_history_by_level = build_objective_history_by_level(solver.solutions)
+
+    with _trace_span("lp_time_total"):
+        lp_solve_time_total = float(
             sum(float(item.get("lp_time", 0.0)) for item in solver.level_summaries if isinstance(item, dict))
-        ),
-        "tree_lp_diags": getattr(solver, "tree_lp_diags", []),
-    }
+        )
+
+    with _trace_span("payload"):
+        return {
+            "primal": final_sol.get("primal"),
+            "dual": final_sol.get("dual"),
+            "final_obj": final_obj,
+            "all_history": solver.solutions,
+            "objective_history_by_level": objective_history_by_level,
+            "sparse_coupling": sparse_coupling,
+            "level_summaries": solver.level_summaries,
+            "lp_solve_time_total": lp_solve_time_total,
+            "tree_lp_diags": getattr(solver, "tree_lp_diags", []),
+        }

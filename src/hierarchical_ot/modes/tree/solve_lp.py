@@ -7,8 +7,17 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from ...core.solver_utils import build_minus_AT_csc, generate_minus_c
+from ...instrumentation.phase_names import (
+    COMPONENT_LP_DIAG_EXTRACT,
+    COMPONENT_LP_GET_SOLUTION,
+    COMPONENT_LP_LOAD_DATA,
+    COMPONENT_LP_PARAM_PACK,
+    COMPONENT_LP_RESULT_PACK,
+    COMPONENT_LP_WARM_START,
+)
 from .infeasibility_check import compute_primal_infeas
 from .logger import tree_log
+from .trace_utils import tree_trace_span
 
 
 def _tree_internal_cost_type(cost_type_raw: str) -> str:
@@ -39,7 +48,26 @@ def _solve_lp(
     is_coarsest: bool = False,
     tree_debug: bool = False,
     require_full_coverage: bool = True,
+    trace_collector: Optional[Any] = None,
+    trace_prefix: str = "solve_ot.lp",
+    trace_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    trace_meta = dict(trace_context or {})
+    trace_level = trace_meta.get("level_idx", level_idx)
+    trace_iter = trace_meta.get("inner_iter", inner_iter)
+    trace_stage = trace_meta.get("stage", "lp_solve")
+
+    def _trace_span(name: str, args: Optional[Dict[str, Any]] = None):
+        return tree_trace_span(
+            trace_collector,
+            name,
+            level_idx=trace_level,
+            inner_iter=trace_iter,
+            stage=trace_stage,
+            args=args,
+        )
+
+    components: Dict[str, float] = {}
     n_s = len(level_s.points)
     n_t = len(level_t.points)
     n_vars = len(keep_coord)
@@ -72,10 +100,26 @@ def _solve_lp(
 
     cost_type = _tree_internal_cost_type(getattr(solver, "_cost_type", "l2^2"))
     p = getattr(solver, "_cost_p", 2.0)
+    t_param_pack = time.perf_counter()
+    with _trace_span(
+        "tree.lp.param_pack",
+        args={"n_vars": int(n_vars)},
+    ):
+        y_init_array = y_init["y"] if isinstance(y_init, dict) else y_init
+        lb = np.zeros(n_vars, dtype=np.float64)
+        ub = np.full(n_vars, np.inf, dtype=np.float64)
+    param_pack_dt = time.perf_counter() - t_param_pack
+    if param_pack_dt > 0.0:
+        components[COMPONENT_LP_PARAM_PACK] = float(param_pack_dt)
+
     t_cost = time.perf_counter()
-    minus_c = generate_minus_c(keep_coord, level_s.points, level_t.points, cost_type, p)
-    c = -minus_c
-    diag["cost_build_time"] = float(time.perf_counter() - t_cost)
+    with _trace_span("tree.lp.cost_build"):
+        minus_c = generate_minus_c(keep_coord, level_s.points, level_t.points, cost_type, p)
+        c = -minus_c
+    cost_build_dt = time.perf_counter() - t_cost
+    diag["cost_build_time"] = float(cost_build_dt)
+    if cost_build_dt > 0.0:
+        components["lp_cost_build"] = float(cost_build_dt)
     diag["c_min"] = float(np.min(c)) if c.size > 0 else 0.0
     diag["c_max"] = float(np.max(c)) if c.size > 0 else 0.0
 
@@ -86,12 +130,21 @@ def _solve_lp(
             )
 
     t_matrix = time.perf_counter()
-    minus_AT = build_minus_AT_csc(keep_coord, n_s, n_t, dtype=np.float64)
-    A_eq = minus_AT.T.tocsc()
-    A_eq.data *= -1.0
-    diag["matrix_build_time"] = float(time.perf_counter() - t_matrix)
+    with _trace_span("tree.lp.matrix_build"):
+        minus_AT = build_minus_AT_csc(keep_coord, n_s, n_t, dtype=np.float64)
+        A_eq = minus_AT.T.tocsc()
+        A_eq.data *= -1.0
+    matrix_build_dt = time.perf_counter() - t_matrix
+    diag["matrix_build_time"] = float(matrix_build_dt)
+    if matrix_build_dt > 0.0:
+        components["lp_matrix_build"] = float(matrix_build_dt)
 
-    b_eq = np.concatenate([mass_s, mass_t])
+    t_rhs = time.perf_counter()
+    with _trace_span("tree.lp.rhs_bounds_pack"):
+        b_eq = np.concatenate([mass_s, mass_t])
+    rhs_bounds_dt = time.perf_counter() - t_rhs
+    if rhs_bounds_dt > 0.0:
+        components["lp_rhs_bounds_pack"] = float(rhs_bounds_dt)
     if A_eq.shape != (n_s + n_t, n_vars):
         raise ValueError(f"Invalid A_eq shape={A_eq.shape}, expected {(n_s + n_t, n_vars)}")
 
@@ -163,9 +216,6 @@ def _solve_lp(
     else:
         dPrimalTol = max(prev_PrimalFeas / 10, stop_thr) if prev_PrimalFeas else stop_thr
 
-    lb = np.zeros(n_vars, dtype=np.float64)
-    ub = np.full(n_vars, np.inf, dtype=np.float64)
-
     if y_init is not None:
         y_vals = np.asarray(y_init)
         if len(y_vals) == len(keep_coord):
@@ -179,7 +229,6 @@ def _solve_lp(
         f"  LP solve: n_vars={n_vars}, n_eqs={n_s+n_t}, "
         f"warm_start_y={y_init is not None}, warm_start_x={x_init is not None}"
     )
-    y_init_array = y_init["y"] if isinstance(y_init, dict) else y_init
     solve_kwargs = dict(
         c=c,
         A_csc=A_eq,
@@ -216,21 +265,55 @@ def _solve_lp(
         except (ValueError, TypeError):
             pass
     t_solve = time.perf_counter()
-    result = solver.solver.solve(**solve_kwargs)
-    diag["backend_solve_wall_time"] = float(time.perf_counter() - t_solve)
+    with _trace_span("tree.lp.backend_total"):
+        result = solver.solver.solve(
+            **solve_kwargs,
+            trace_collector=trace_collector,
+            trace_prefix="tree.lp.backend",
+        )
+    backend_total_dt = time.perf_counter() - t_solve
+    diag["backend_solve_wall_time"] = float(backend_total_dt)
     solve_time_attr = getattr(result, "solve_time", None)
     diag["backend_solve_time"] = None if solve_time_attr is None else float(solve_time_attr)
-    solver_diag = getattr(result, "solver_diag", None)
-    if isinstance(solver_diag, dict):
-        for key, value in solver_diag.items():
-            if value is None:
-                continue
-            diag[f"solver_{key}"] = value
+    t_diag_extract = time.perf_counter()
+    with _trace_span("tree.lp.diag_extract"):
+        solver_diag = getattr(result, "solver_diag", None)
+        if isinstance(solver_diag, dict):
+            for key, value in solver_diag.items():
+                if value is None:
+                    continue
+                diag[f"solver_{key}"] = value
+            load_data_time = float(solver_diag.get("load_data_time", 0.0) or 0.0)
+            warm_start_time = float(solver_diag.get("warm_start_time", 0.0) or 0.0)
+            get_solution_time = float(solver_diag.get("get_solution_time", 0.0) or 0.0)
+            native_solve_time = float(solver_diag.get("native_solve_wall_time", 0.0) or 0.0)
+            construct_time = float(solver_diag.get("construct_time", 0.0) or 0.0)
+            if construct_time > 0.0:
+                components["lp_backend_construct"] = construct_time
+            if load_data_time > 0.0:
+                components[COMPONENT_LP_LOAD_DATA] = load_data_time
+            if warm_start_time > 0.0:
+                components[COMPONENT_LP_WARM_START] = warm_start_time
+            if get_solution_time > 0.0:
+                components[COMPONENT_LP_GET_SOLUTION] = get_solution_time
+            if native_solve_time > 0.0:
+                components["lp_backend_solve"] = native_solve_time
+    diag_extract_dt = time.perf_counter() - t_diag_extract
+    if diag_extract_dt > 0.0:
+        components[COMPONENT_LP_DIAG_EXTRACT] = float(diag_extract_dt)
 
     diag["termination_reason"] = getattr(result, "termination_reason", None)
     lp_payload = None
     if not result.success:
         lp_payload = {"c": c, "A_eq": A_eq, "b_eq": b_eq, "lb": lb, "ub": ub}
+    result_pack_dt = 0.0
+    if result.success:
+        t_result_pack = time.perf_counter()
+        with _trace_span("tree.lp.result_pack"):
+            pass
+        result_pack_dt = time.perf_counter() - t_result_pack
+        if result_pack_dt > 0.0:
+            components[COMPONENT_LP_RESULT_PACK] = float(result_pack_dt)
     return {
         "success": result.success,
         "x": result.y if result.success else None,
@@ -244,6 +327,7 @@ def _solve_lp(
         "termination_reason": getattr(result, "termination_reason", None),
         "diag": diag,
         "lp_payload": lp_payload,
+        "components": components,
     }
 
 
@@ -262,6 +346,9 @@ def solve_tree_lp_with_fallback(
     prev_PrimalFeas: Optional[float],
     tree_debug: bool,
     tree_infeas_fallback: str,
+    trace_collector: Optional[Any] = None,
+    trace_prefix: str = "solve_ot.lp",
+    trace_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     num_levels = solver.hierarchy_s.num_levels
     is_coarsest = level_idx == num_levels
@@ -283,6 +370,9 @@ def solve_tree_lp_with_fallback(
         level_idx=level_idx,
         is_coarsest=is_coarsest,
         tree_debug=tree_debug,
+        trace_collector=trace_collector,
+        trace_prefix=trace_prefix,
+        trace_context=trace_context,
     )
 
     if lp_result.get("diag"):
@@ -309,6 +399,9 @@ def tree_solve_lp_pack(
     prev_PrimalFeas: Optional[float],
     tree_debug: bool,
     tree_infeas_fallback: str,
+    trace_collector: Optional[Any] = None,
+    trace_prefix: str = "solve_ot.lp",
+    trace_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     t_lp = time.perf_counter()
     with solver._profiler.timer("lp", gpu_possible=True):
@@ -326,6 +419,9 @@ def tree_solve_lp_pack(
             prev_PrimalFeas=prev_PrimalFeas,
             tree_debug=tree_debug,
             tree_infeas_fallback=tree_infeas_fallback,
+            trace_collector=trace_collector,
+            trace_prefix=trace_prefix,
+            trace_context=trace_context,
         )
     lp_time = time.perf_counter() - t_lp
     lp_result = lp_pack["lp_result"]
@@ -350,4 +446,5 @@ def tree_solve_lp_pack(
         "keep": lp_pack["keep"],
         "keep_coord": lp_pack["keep_coord"],
         "lp_time": float(lp_time),
+        "components": lp_result.get("components", {}),
     }

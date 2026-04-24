@@ -22,6 +22,7 @@ from ...instrumentation.phase_names import (
 )
 from ...types.base import ActiveSupportStrategy, BaseHierarchy, HierarchyLevel
 from .logger import tree_log
+from .trace_utils import tree_trace_span
 from .violation_check import apply_violation_check
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,15 @@ except Exception:  # pragma: no cover
 
 
 def build_active_set_first_iter(solver, **kwargs):
+    """
+    CN: 构造某个 tree level 在第一次内迭代前使用的初始 active set。最粗层直接全连接，
+    其余层先从 coarse level prolongate/refine warm start，再执行 shielding、violation check
+    和 warm-start 重映射，得到该 level 的首轮 LP 支持集。
+    EN: Build the initial active set used before the first inner iteration of a tree level.
+    The coarsest level uses full support directly; finer levels prolongate/refine the coarse
+    warm start, then run shielding, violation checking, and warm-start remapping to produce
+    the first LP support for this level.
+    """
     level_idx = kwargs["level_idx"]
     level_s = kwargs["level_s"]
     level_t = kwargs["level_t"]
@@ -44,6 +54,9 @@ def build_active_set_first_iter(solver, **kwargs):
     vd_thr = kwargs["vd_thr"]
     check_method = kwargs["check_method"]
     sampled_config = kwargs.get("sampled_config")
+    trace_collector = kwargs.get("trace_collector")
+    trace_prefix = str(kwargs.get("trace_prefix", "solve_ot"))
+    trace_context = dict(kwargs.get("trace_context", {}))
 
     n_s = len(level_s.points)
     n_t = len(level_t.points)
@@ -108,6 +121,9 @@ def build_active_set_first_iter(solver, **kwargs):
         hierarchy_s=solver.hierarchy_s,
         hierarchy_t=solver.hierarchy_t,
         build_aux=False,
+        trace_collector=trace_collector,
+        trace_prefix=trace_prefix,
+        trace_context=trace_context,
     )
     update_time = time.perf_counter() - t_shield
     keep_union_time = 0.0
@@ -129,7 +145,7 @@ def build_active_set_first_iter(solver, **kwargs):
     )
     keep = np.asarray(update_result["keep"], dtype=np.int64)
     t_vcheck = time.perf_counter()
-    keep = apply_violation_check(
+    keep, _ = apply_violation_check(
         solver,
         x_dual=x_init,
         level_s=level_s,
@@ -140,6 +156,10 @@ def build_active_set_first_iter(solver, **kwargs):
         vd_thr=vd_thr,
         check_method=check_method,
         sampled_config=sampled_config,
+        trace_collector=trace_collector,
+        trace_prefix=trace_prefix,
+        trace_context=trace_context,
+        return_meta=True,
     )
     prepare_breakdown["violation_check"] = time.perf_counter() - t_vcheck
     t0 = time.perf_counter()
@@ -165,6 +185,15 @@ def build_active_set_first_iter(solver, **kwargs):
 
 
 def build_active_set_subsequent_iter(solver, **kwargs):
+    """
+    CN: 基于上一轮 LP 解更新下一轮内迭代要用的 active set。流程是先筛掉近零流量边，
+    再执行 shielding、violation check、use_last 合并和 warm-start 重映射，为下一轮 LP
+    提供新的支持集与初始值。
+    EN: Update the active set for the next inner iteration based on the previous LP solution.
+    The flow first filters near-zero transport entries, then runs shielding, violation
+    checking, use-last merging, and warm-start remapping to prepare the next LP support
+    and initial values.
+    """
     level_s = kwargs["level_s"]
     level_t = kwargs["level_t"]
     x_solution_last = kwargs["x_solution_last"]
@@ -177,6 +206,9 @@ def build_active_set_subsequent_iter(solver, **kwargs):
     check_method = kwargs["check_method"]
     inner_iter = kwargs["inner_iter"]
     sampled_config = kwargs.get("sampled_config")
+    trace_collector = kwargs.get("trace_collector")
+    trace_prefix = str(kwargs.get("trace_prefix", "solve_ot"))
+    trace_context = dict(kwargs.get("trace_context", {}))
 
     n_t = len(level_t.points)
     x_init = x_solution_last
@@ -199,6 +231,9 @@ def build_active_set_subsequent_iter(solver, **kwargs):
         hierarchy_s=solver.hierarchy_s,
         hierarchy_t=solver.hierarchy_t,
         build_aux=False,
+        trace_collector=trace_collector,
+        trace_prefix=trace_prefix,
+        trace_context=trace_context,
     )
     update_time = time.perf_counter() - t_shield
     keep_union_time = 0.0
@@ -221,7 +256,7 @@ def build_active_set_subsequent_iter(solver, **kwargs):
     keep = np.asarray(update_result["keep"], dtype=np.int64)
     trace_keep_after_shield = int(len(keep))
     t_vcheck = time.perf_counter()
-    keep = apply_violation_check(
+    keep, _ = apply_violation_check(
         solver,
         x_dual=x_init,
         level_s=level_s,
@@ -232,6 +267,10 @@ def build_active_set_subsequent_iter(solver, **kwargs):
         vd_thr=vd_thr,
         check_method=check_method,
         sampled_config=sampled_config,
+        trace_collector=trace_collector,
+        trace_prefix=trace_prefix,
+        trace_context=trace_context,
+        return_meta=True,
     )
     prepare_breakdown["violation_check"] = time.perf_counter() - t_vcheck
     trace_keep_after_check = int(len(keep))
@@ -271,6 +310,13 @@ def build_active_set_subsequent_iter(solver, **kwargs):
 
 
 def merge_with_use_last(solver, **kwargs):
+    """
+    CN: 按 `use_last` / `use_last_after_inner0` 规则把当前候选 active set 与上一轮缓存的
+    `keep_last` 合并，减少相邻内迭代之间支持集抖动。
+    EN: Merge the current candidate active set with the cached `keep_last` according to
+    `use_last` / `use_last_after_inner0`, reducing support-set oscillation between adjacent
+    inner iterations.
+    """
     keep = np.asarray(kwargs["keep"], dtype=np.int64)
     use_last = kwargs["use_last"]
     use_last_after_inner0 = kwargs["use_last_after_inner0"]
@@ -352,6 +398,12 @@ class ShieldingStrategy(ActiveSupportStrategy):
         hierarchy_t: BaseHierarchy = None,
         **kwargs,
     ) -> Dict[str, np.ndarray]:
+        """
+        CN: 为最粗层初始化全连接 active set，并在需要时先把层次结构拍平成后续 numba 搜索可用
+        的数组表示。
+        EN: Initialize the full-support active set for the coarsest level and, when needed,
+        flatten the hierarchies into array layouts usable by later numba-based searches.
+        """
         n_s = len(level_s.points)
         n_t = len(level_t.points)
 
@@ -397,6 +449,30 @@ class ShieldingStrategy(ActiveSupportStrategy):
         hierarchy_t: BaseHierarchy,
         **kwargs,
     ) -> Dict[str, np.ndarray]:
+        """
+        CN: 给定当前 dual/transport 支持，执行 tree shielding 主流程：选每个 source 的代表目标
+        `t_map`，构造 sentinel，搜索未被屏蔽的 `Yhat`，再与已有支持集合并，产出新的 active set。
+        EN: Run the main tree-shielding pipeline from the current dual/transport support:
+        pick a representative target `t_map` for each source, build sentinels, search for
+        unshielded `Yhat` pairs, and union them with the existing support to produce the
+        next active set.
+        """
+        trace_collector = kwargs.get("trace_collector")
+        trace_context = dict(kwargs.get("trace_context", {}))
+        trace_level = trace_context.get("level_idx")
+        trace_iter = trace_context.get("inner_iter")
+        trace_stage = trace_context.get("stage", "post_lp_pricing")
+
+        def _trace_span(name: str, args: Optional[Dict[str, object]] = None):
+            return tree_trace_span(
+                trace_collector,
+                name,
+                level_idx=trace_level,
+                inner_iter=trace_iter,
+                stage=trace_stage,
+                args=args,
+            )
+
         build_aux = bool(kwargs.get("build_aux", True))
         n_s = len(level_s.points)
         n_t = len(level_t.points)
@@ -425,42 +501,46 @@ class ShieldingStrategy(ActiveSupportStrategy):
         if self.shield_impl == "halo" and halo_build_shield is not None:
             t0 = time.perf_counter()
             detailed_timing: Dict[str, float] = {}
-            try:
-                keep_1d, _len_dict = halo_build_shield(
-                    level_s,
-                    level_t,
-                    y_val,
-                    y_keep,
-                    hierarchy_s,
-                    hierarchy_t,
-                    return_gpu=False,
-                    k_neighbors=self.k_neighbors,
-                    cost_type=self.cost_type,
-                    p=self.cost_p,
-                    search_method=self.search_method,
-                    max_pairs_per_xA=self.max_pairs_per_xA,
-                    verbose_tree_stats=False,
-                    detailed_timing=detailed_timing,
-                )
-            except TypeError as exc:
-                if "detailed_timing" not in str(exc):
-                    raise
-                detailed_timing.clear()
-                keep_1d, _len_dict = halo_build_shield(
-                    level_s,
-                    level_t,
-                    y_val,
-                    y_keep,
-                    hierarchy_s,
-                    hierarchy_t,
-                    return_gpu=False,
-                    k_neighbors=self.k_neighbors,
-                    cost_type=self.cost_type,
-                    p=self.cost_p,
-                    search_method=self.search_method,
-                    max_pairs_per_xA=self.max_pairs_per_xA,
-                    verbose_tree_stats=False,
-                )
+            with _trace_span(
+                "tree.shield.build_halo_shield",
+                args={"shield_impl": self.shield_impl, "nnz_input": int(len(y_keep))},
+            ):
+                try:
+                    keep_1d, _len_dict = halo_build_shield(
+                        level_s,
+                        level_t,
+                        y_val,
+                        y_keep,
+                        hierarchy_s,
+                        hierarchy_t,
+                        return_gpu=False,
+                        k_neighbors=self.k_neighbors,
+                        cost_type=self.cost_type,
+                        p=self.cost_p,
+                        search_method=self.search_method,
+                        max_pairs_per_xA=self.max_pairs_per_xA,
+                        verbose_tree_stats=False,
+                        detailed_timing=detailed_timing,
+                    )
+                except TypeError as exc:
+                    if "detailed_timing" not in str(exc):
+                        raise
+                    detailed_timing.clear()
+                    keep_1d, _len_dict = halo_build_shield(
+                        level_s,
+                        level_t,
+                        y_val,
+                        y_keep,
+                        hierarchy_s,
+                        hierarchy_t,
+                        return_gpu=False,
+                        k_neighbors=self.k_neighbors,
+                        cost_type=self.cost_type,
+                        p=self.cost_p,
+                        search_method=self.search_method,
+                        max_pairs_per_xA=self.max_pairs_per_xA,
+                        verbose_tree_stats=False,
+                    )
             timing["shield_total"] = time.perf_counter() - t0
             if detailed_timing:
                 pick_t = float(detailed_timing.get("pick_t_map", 0.0) or 0.0)
@@ -478,6 +558,11 @@ class ShieldingStrategy(ActiveSupportStrategy):
             result = {
                 "keep": np.asarray(keep_1d, dtype=np.int64),
                 "timing": timing,
+                "diag": {
+                    "shield_impl": self.shield_impl,
+                    "nnz_input": int(len(y_keep)),
+                    "keep_size": int(len(keep_1d)),
+                },
             }
             if build_aux:
                 result["keep_coord"] = decode_keep_1d_to_struct(keep_1d, n_t)
@@ -485,17 +570,16 @@ class ShieldingStrategy(ActiveSupportStrategy):
             return result
 
         t0 = time.perf_counter()
-        if self.shield_impl == "halo":
+        with _trace_span(
+            "tree.shield.pick_t_map",
+            args={"shield_impl": self.shield_impl, "nnz_input": int(len(y_keep))},
+        ):
             best_idx_y, _ = _pick_t_map_arrays(y_keep, y_val, n_s, n_t)
-            t_map = None
-        else:
-            t_map, _ = _pick_t_map(y_keep, y_val, n_s, n_t)
-            best_idx_y = None
         timing["t_map"] = time.perf_counter() - t0
         timing[COMPONENT_SHIELD_PICK_T_MAP] = timing["t_map"]
 
         if self.verbose:
-            t_map_size = int(np.sum(best_idx_y >= 0)) if best_idx_y is not None else len(t_map)
+            t_map_size = int(np.sum(best_idx_y >= 0))
             logger.debug("  [Shielding] t_map size: %s/%s", t_map_size, n_s)
 
         t0 = time.perf_counter()
@@ -504,19 +588,13 @@ class ShieldingStrategy(ActiveSupportStrategy):
             if level_s.knn_indices is not None
             else np.empty((n_s, 0), dtype=np.int32)
         )
-        if self.shield_impl == "halo":
+        with _trace_span("tree.shield.prepare_sentinels", args={"k_neighbors": int(self.k_neighbors)}):
             sentinels_list, shield_arr = _prepare_sentinels_for_numba_fast(
                 nodes_X=level_s.points,
                 nodes_Y=level_t.points,
-                t_idx=best_idx_y
-                if best_idx_y is not None
-                else np.full(n_s, -1, dtype=np.int64),
+                t_idx=best_idx_y,
                 all_knn_indices=knn_indices,
                 k_neighbors=self.k_neighbors,
-            )
-        else:
-            sentinels_list, shield_arr = _build_sentinels(
-                level_s, t_map, knn_indices, self.k_neighbors, level_Y=level_t
             )
         timing["sentinels"] = time.perf_counter() - t0
         timing[COMPONENT_SHIELD_SENTINELS] = timing["sentinels"]
@@ -525,17 +603,18 @@ class ShieldingStrategy(ActiveSupportStrategy):
             logger.debug("    [Shielding] shield_arr=%s", len(shield_arr))
 
         t0 = time.perf_counter()
-        if hasattr(hierarchy_t, "flat_centers"):
-            yhat_pairs = build_Yhat_tree_numba(
-                nodes_X=level_s.points,
-                hierarchy_Y=hierarchy_t,
-                sentinels_list=sentinels_list,
-                target_level_idx=level_t.level_idx,
-                max_pairs_per_xA=self.max_pairs_per_xA,
-                verbose=self.verbose,
-            )
-        else:
-            yhat_pairs = np.empty((0, 2), dtype=np.int32)
+        with _trace_span("tree.shield.build_yhat", args={"target_level_idx": int(level_t.level_idx)}):
+            if hasattr(hierarchy_t, "flat_centers"):
+                yhat_pairs = build_Yhat_tree_numba(
+                    nodes_X=level_s.points,
+                    hierarchy_Y=hierarchy_t,
+                    sentinels_list=sentinels_list,
+                    target_level_idx=level_t.level_idx,
+                    max_pairs_per_xA=self.max_pairs_per_xA,
+                    verbose=self.verbose,
+                )
+            else:
+                yhat_pairs = np.empty((0, 2), dtype=np.int32)
         timing["yhat"] = time.perf_counter() - t0
         timing[COMPONENT_SHIELD_YHAT] = timing["yhat"]
 
@@ -557,11 +636,12 @@ class ShieldingStrategy(ActiveSupportStrategy):
             )
             parts_1d.append(yhat_1d)
 
-        if parts_1d:
-            all_1d = np.concatenate(parts_1d)
-            keep_1d = np.unique(all_1d)
-        else:
-            keep_1d = np.empty(0, dtype=np.int64)
+        with _trace_span("tree.shield.union"):
+            if parts_1d:
+                all_1d = np.concatenate(parts_1d)
+                keep_1d = np.unique(all_1d)
+            else:
+                keep_1d = np.empty(0, dtype=np.int64)
         timing["keep_union"] = time.perf_counter() - t0
         timing[COMPONENT_SHIELD_UNION] = timing["keep_union"]
 
@@ -575,6 +655,14 @@ class ShieldingStrategy(ActiveSupportStrategy):
         result = {
             "keep": keep_1d,
             "timing": timing,
+            "diag": {
+                "shield_impl": self.shield_impl,
+                "nnz_input": int(len(y_keep)),
+                "t_map_size": int(np.sum(best_idx_y >= 0)),
+                "shield_arr_size": int(len(shield_arr)),
+                "yhat_size": int(len(yhat_pairs)),
+                "keep_size": int(len(keep_1d)),
+            },
         }
         if build_aux:
             result["keep_coord"] = decode_keep_1d_to_struct(keep_1d, n_t)
@@ -587,6 +675,12 @@ class ShieldingStrategy(ActiveSupportStrategy):
 
 @njit(cache=True)
 def _pick_t_core_numba(idx_x_all, idx_y_all, y_val, n_X):
+    """
+    CN: 在 numba 内核中为每个 source 行选择流量值最大的目标索引，形成 shielding 所需的
+    代表目标映射基础数据。
+    EN: In a numba kernel, select the target index with the largest flow for each source
+    row, forming the representative target mapping used by shielding.
+    """
     best_val = np.empty(n_X, dtype=y_val.dtype)
     best_idx_y = np.empty(n_X, dtype=np.int64)
 
@@ -607,6 +701,12 @@ def _pick_t_core_numba(idx_x_all, idx_y_all, y_val, n_X):
 def _pick_t_map_arrays(
     y_keep: np.ndarray, y_val: np.ndarray, n_X: int, n_Y: int
 ) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    CN: 把稀疏 transport 支持 `(keep, y)` 转成按 source 索引对齐的数组版 `t_map`，
+    便于后续快速构造 sentinel。
+    EN: Convert sparse transport support `(keep, y)` into an array-aligned `t_map` by source
+    index, making later sentinel construction faster.
+    """
     if y_keep.size == 0:
         return np.full(n_X, -1, dtype=np.int64), np.full(n_X, -np.inf, dtype=np.float32)
 
@@ -619,6 +719,12 @@ def _pick_t_map_arrays(
 
 
 def _pick_t_map(y_keep, y_val, n_X, n_Y):
+    """
+    CN: 生成字典版 `t_map`，主要供本地 shielding 兼容路径使用；语义与数组版相同，但便于
+    Python 侧按节点访问。
+    EN: Build a dictionary-based `t_map`, mainly for the local shielding compatibility path;
+    it has the same meaning as the array version but is convenient for Python-side node lookup.
+    """
     t_map = {}
     t_map_values = {}
 
@@ -647,6 +753,12 @@ def _prepare_sentinels_for_numba_fast(
     all_knn_indices: np.ndarray,
     k_neighbors: int,
 ) -> Tuple[List[np.ndarray], np.ndarray]:
+    """
+    CN: 根据每个 source 节点的近邻和 `t_map`，批量构造 numba 搜索使用的 sentinel 张量，
+    同时生成 shielding 必保留的 `(x_A, t_S)` 配对。
+    EN: Batch-build the sentinel tensors used by the numba search from per-source neighbors
+    and `t_map`, while also producing the shielding pairs `(x_A, t_S)` that must be kept.
+    """
     n_X, dim = nodes_X.shape
     if all_knn_indices is None or all_knn_indices.size == 0 or k_neighbors <= 0:
         sentinels_by_A = [np.empty((0, 2, dim), dtype=np.float64) for _ in range(n_X)]
@@ -717,6 +829,13 @@ def _prepare_sentinels_for_numba_fast(
 
 
 def _build_sentinels(level_X, t_map, knn_indices, k_neighbors, level_Y=None):
+    """
+    CN: Python 兼容版本的 sentinel 构造逻辑。它逐个 source 节点遍历近邻，拼出 shielding
+    需要的向量差和对应目标代表点。
+    EN: Python compatibility version of sentinel construction. It iterates source nodes and
+    their neighbors to assemble the vector differences and representative target points needed
+    by shielding.
+    """
     nodes_X = level_X.points
     n_X = len(nodes_X)
     dim = nodes_X.shape[1]
@@ -774,6 +893,12 @@ def _get_exact_inner_njit(
     rep_B: np.ndarray,
     candidates: np.ndarray,
 ) -> float:
+    """
+    CN: 对单个候选目标点 `rep_B` 与一组 sentinel 精确计算 shielding 判据中的最大内积值，
+    用于决定该目标是否会被屏蔽。
+    EN: For one candidate target point `rep_B`, compute the maximum inner-product value in the
+    shielding criterion against a set of sentinels, deciding whether the target is shielded.
+    """
     best = -1e300
     k_eff = candidates.shape[0]
     if k_eff == 0:
@@ -811,6 +936,12 @@ def _search_all_xA_count(
     target_level_idx,
     max_pairs_per_xA=-1,
 ) -> np.ndarray:
+    """
+    CN: 在真正写出 `Yhat` 配对之前，先对每个 source 节点统计未被屏蔽的目标数量，
+    以便为后续填充阶段分配精确大小的输出缓冲区。
+    EN: Before materializing `Yhat` pairs, count the number of unshielded targets for each
+    source node so the fill stage can allocate an exact-sized output buffer.
+    """
     n_X, dim = nodes_X.shape
     counts = np.zeros(n_X, dtype=np.int64)
     max_stack_size = centers.shape[0] + root_indices.shape[0] + 8
@@ -922,6 +1053,12 @@ def _search_all_xA_fill(
     pairs_all,
     max_pairs_per_xA=-1,
 ):
+    """
+    CN: 按 `_search_all_xA_count` 给出的偏移量把所有未被屏蔽的 `(x_A, y_B)` 配对写入输出数组，
+    形成 `Yhat` 的原始结果。
+    EN: Using the offsets computed by `_search_all_xA_count`, write all unshielded
+    `(x_A, y_B)` pairs into the output array to form the raw `Yhat` result.
+    """
     n_X, dim = nodes_X.shape
     max_stack_size = centers.shape[0] + root_indices.shape[0] + 8
     prune_threshold = 0.0
@@ -1023,6 +1160,12 @@ def build_Yhat_tree_numba(
     max_pairs_per_xA: int = -1,
     verbose: bool = False,
 ) -> np.ndarray:
+    """
+    CN: 基于拍平后的目标层次结构和 sentinel，为每个 source 节点执行树搜索，找出所有未被
+    屏蔽的 `Yhat` 候选配对。
+    EN: Run the tree search for each source node using the flattened target hierarchy and
+    sentinels, producing all unshielded `Yhat` candidate pairs.
+    """
     t0 = time.perf_counter()
 
     n_X = nodes_X.shape[0]

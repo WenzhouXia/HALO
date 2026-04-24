@@ -28,6 +28,7 @@ except ImportError:
     HAS_FAISS = False
 
 from ...types.base import BaseHierarchy, HierarchyLevel
+from .trace_utils import tree_trace_span
 
 
 def suggest_num_levels(n_points: int, dim: int, split_mode: str) -> int:
@@ -376,6 +377,7 @@ class TreeHierarchy(BaseHierarchy):
         use_gpu_bucket: bool = False,
         depth_min: Optional[int] = None,  # 最少层数
         depth_max: Optional[int] = None,  # 最多层数
+        knn_workers: int = 1,
         verbose: bool = False,
     ):
         """
@@ -393,6 +395,7 @@ class TreeHierarchy(BaseHierarchy):
         self.use_gpu_bucket = use_gpu_bucket
         self.depth_min = depth_min  # 最少层数
         self.depth_max = depth_max if depth_max is not None else 100  # 最多层数
+        self.knn_workers = int(knn_workers)
         self.verbose = verbose
 
         # 内部状态
@@ -499,78 +502,121 @@ class TreeHierarchy(BaseHierarchy):
             initial_masses: (N,) 质量分布，None 表示均匀分布
         """
         t0 = time.perf_counter()
+        trace_collector = kwargs.get("trace_collector")
+        trace_context = dict(kwargs.get("trace_context", {}))
+        trace_side = trace_context.get("hierarchy_side")
+        self._active_trace_collector = trace_collector
+        self._active_trace_side = trace_side
+
+        def _trace_span(name: str, args: Optional[Dict[str, object]] = None):
+            merged_args: Dict[str, object] = {}
+            if trace_side is not None:
+                merged_args["side"] = str(trace_side)
+            if args:
+                merged_args.update(args)
+            return tree_trace_span(
+                trace_collector,
+                name,
+                stage="build_hierarchy",
+                args=merged_args,
+            )
 
         # 保存初始数据
-        points = np.asarray(initial_points, dtype=np.float64)
-        self.dim = points.shape[1]
-        n_points = len(points)
+        with _trace_span("tree.hierarchy.prepare_inputs"):
+            points = np.asarray(initial_points, dtype=np.float64)
+            self.dim = points.shape[1]
+            n_points = len(points)
 
-        if initial_masses is None:
-            masses = np.full(n_points, 1.0 / n_points, dtype=np.float64)
-        else:
-            masses = np.asarray(initial_masses, dtype=np.float64)
-            masses /= masses.sum()
+            if initial_masses is None:
+                masses = np.full(n_points, 1.0 / n_points, dtype=np.float64)
+            else:
+                masses = np.asarray(initial_masses, dtype=np.float64)
+                masses /= masses.sum()
 
         # 自动确定层数（自适应计算）
         if self._num_levels is None:
             # [HALO 对齐] 使用构造函数传入的 depth_min/depth_max
             depth_min = self.depth_min if self.depth_min is not None else 2
             depth_max = self.depth_max if self.depth_max is not None else 100
-            self._num_levels = self._estimate_optimal_num_levels(
-                points, masses, depth_min, depth_max
-            )
+            with _trace_span(
+                "tree.hierarchy.estimate_depth",
+                args={"depth_min": int(depth_min), "depth_max": int(depth_max)},
+            ):
+                self._num_levels = self._estimate_optimal_num_levels(
+                    points, masses, depth_min, depth_max
+                )
         self._build_root_level = self._num_levels
 
         # 初始化
-        self._nodes_by_level = [[] for _ in range(self.num_levels + 1)]
-        self._global_node_index = 0
-        self._l0_to_l1_map = np.zeros(n_points, dtype=np.int32)
+        with _trace_span("tree.hierarchy.init_state", args={"num_levels": int(self._num_levels)}):
+            self._nodes_by_level = [[] for _ in range(self.num_levels + 1)]
+            self._global_node_index = 0
+            self._l0_to_l1_map = np.zeros(n_points, dtype=np.int32)
 
         # 计算根包围盒
-        min_coords = points.min(axis=0)
-        max_coords = points.max(axis=0)
-        box_tol = 1e-10
-        root_bbox = np.stack([min_coords - box_tol, max_coords + box_tol], axis=0)
+        with _trace_span("tree.hierarchy.root_bbox", args={"n_points": int(n_points)}):
+            min_coords = points.min(axis=0)
+            max_coords = points.max(axis=0)
+            box_tol = 1e-10
+            root_bbox = np.stack([min_coords - box_tol, max_coords + box_tol], axis=0)
 
         # 根据 build_mode 选择构建方法
         build_mode = kwargs.get('build_mode', self.build_mode)
 
         if build_mode == "bucket" and self.split_mode == "2^n":
             # [HALO 对齐] 使用 bucket 模式
-            self._build_bucket(points, masses, root_bbox)
+            with _trace_span(
+                "tree.hierarchy.build_bucket",
+                args={"split_mode": str(self.split_mode), "build_mode": str(build_mode)},
+            ):
+                self._build_bucket(points, masses, root_bbox)
         else:
             # 使用递归模式
-            self._build_recursive(
-                level=self.num_levels,
-                parent_node_index=-1,
-                point_indices=np.arange(n_points, dtype=np.int32),
-                bbox=root_bbox,
-                points=points,
-                masses=masses,
-            )
+            with _trace_span(
+                "tree.hierarchy.build_recursive",
+                args={"split_mode": str(self.split_mode), "build_mode": str(build_mode)},
+            ):
+                self._build_recursive(
+                    level=self.num_levels,
+                    parent_node_index=-1,
+                    point_indices=np.arange(n_points, dtype=np.int32),
+                    bbox=root_bbox,
+                    points=points,
+                    masses=masses,
+                )
 
         # 创建公开层级
-        self._create_public_levels(points, masses)
+        with _trace_span("tree.hierarchy.public_levels"):
+            self._create_public_levels(points, masses)
 
         # [HALO 对齐] 自动截断顶层：保留节点数 >= target_coarse_size 的层
-        self._trim_to_target_size(target_coarse_size=self.target_coarse_size)
+        with _trace_span(
+            "tree.hierarchy.trim",
+            args={"target_coarse_size": int(self.target_coarse_size)},
+        ):
+            self._trim_to_target_size(target_coarse_size=self.target_coarse_size)
 
         # 计算 K-NN
-        self._compute_knn()
+        with _trace_span("tree.hierarchy.knn", args={"k_neighbors": int(self.k_neighbors)}):
+            self._compute_knn()
 
         self.build_time = time.perf_counter() - t0
         if self.verbose:
             print(f"[TreeHierarchy] 构建完成: {self.num_levels} 层, 用时 {self.build_time:.3f}s")
 
         # 打印层次结构信息（与 HALO 一致）
-        print("层次结构信息:")
-        print(f"- 维度: {self.dim}")
-        print(f"- 层数: {self.num_levels}")
-        for level_idx in range(self.num_levels, -1, -1):
-            if level_idx < len(self.levels):
-                n_points = len(self.levels[level_idx].points)
-                print(f"  - 层 {level_idx}:")
-                print(f"    - 非空节点数: {n_points}")
+        with _trace_span("tree.hierarchy.print_summary"):
+            print("层次结构信息:")
+            print(f"- 维度: {self.dim}")
+            print(f"- 层数: {self.num_levels}")
+            for level_idx in range(self.num_levels, -1, -1):
+                if level_idx < len(self.levels):
+                    n_points = len(self.levels[level_idx].points)
+                    print(f"  - 层 {level_idx}:")
+                    print(f"    - 非空节点数: {n_points}")
+
+        self._active_trace_collector = None
+        self._active_trace_side = None
 
     # =========================================================================
     # Bucket 模式实现 (与 HALO 完全对齐)
@@ -947,6 +993,21 @@ class TreeHierarchy(BaseHierarchy):
         EN: Create public levels from bucket mode data.
         """
         K = self._build_root_level
+        trace_collector = getattr(self, "_active_trace_collector", None)
+        trace_side = getattr(self, "_active_trace_side", None)
+
+        def _trace_span(name: str, args: Optional[Dict[str, object]] = None):
+            merged_args: Dict[str, object] = {}
+            if trace_side is not None:
+                merged_args["side"] = str(trace_side)
+            if args:
+                merged_args.update(args)
+            return tree_trace_span(
+                trace_collector,
+                name,
+                stage="build_hierarchy",
+                args=merged_args,
+            )
 
         for l in range(1, K + 1):
             if l not in self.layer_offsets:
@@ -955,42 +1016,52 @@ class TreeHierarchy(BaseHierarchy):
                 )
                 continue
 
-            start = self.layer_offsets[l]
-            count = len(self.layers_data[l]['meta'])
-            end = start + count
+            with _trace_span("tree.hierarchy.public_levels.level_views", args={"level_idx": int(l)}):
+                start = self.layer_offsets[l]
+                count = len(self.layers_data[l]['meta'])
+                end = start + count
 
-            # 切片
-            pts = self.flat_centers[start:end]
-            mass = self.flat_masses[start:end]
-            rad = self.flat_radii[start:end]
+                pts = self.flat_centers[start:end]
+                mass = self.flat_masses[start:end]
+                rad = self.flat_radii[start:end]
 
-            # Parent Labels
-            if l < K and (l + 1) in self.layer_offsets:
-                parent_offset = self.layer_offsets[l + 1]
-                global_parents = self.flat_parent_indices[start:end]
-                parent_labels = (global_parents - parent_offset).astype(np.int32)
-            else:
-                parent_labels = None
+                if l < K and (l + 1) in self.layer_offsets:
+                    parent_offset = self.layer_offsets[l + 1]
+                    global_parents = self.flat_parent_indices[start:end]
+                    parent_labels = (global_parents - parent_offset).astype(np.int32)
+                else:
+                    parent_labels = None
 
-            # 计算 children CSR
-            children_offsets, children_indices = self._compute_children_csr(l)
+            with _trace_span(
+                "tree.hierarchy.public_levels.children_csr",
+                args={"level_idx": int(l), "n_nodes": int(count)},
+            ):
+                children_offsets, children_indices = self._compute_children_csr(l)
 
-            # Internal nodes
-            _internal_nodes = self._nodes_by_level[l] if l < len(self._nodes_by_level) else []
+            with _trace_span(
+                "tree.hierarchy.public_levels.internal_nodes",
+                args={"level_idx": int(l), "n_nodes": int(count)},
+            ):
+                # bucket 模式后续 tree search 直接复用 flat arrays，不再回建 _internal_nodes。
+                _internal_nodes = []
 
-            level = HierarchyLevel(
-                level_idx=l,
-                points=pts,
-                masses=mass,
-                cost_vec=None,
-                child_labels=None,
-                radius=rad,
-                parent_labels=parent_labels,
-                knn_indices=None,
-                children_offsets=children_offsets,
-                children_indices=children_indices,
-                _internal_nodes=_internal_nodes,
-            )
+            with _trace_span(
+                "tree.hierarchy.public_levels.level_object",
+                args={"level_idx": int(l), "n_nodes": int(count)},
+            ):
+                level = HierarchyLevel(
+                    level_idx=l,
+                    points=pts,
+                    masses=mass,
+                    cost_vec=None,
+                    child_labels=None,
+                    radius=rad,
+                    parent_labels=parent_labels,
+                    knn_indices=None,
+                    children_offsets=children_offsets,
+                    children_indices=children_indices,
+                    _internal_nodes=_internal_nodes,
+                )
             self.levels.append(level)
 
     def _create_public_levels_recursive(self, points: np.ndarray, masses: np.ndarray):
@@ -1170,53 +1241,50 @@ class TreeHierarchy(BaseHierarchy):
             n_k = len(self.layers_data[K]['meta'])
             self.flat_root_indices = np.arange(k_start, k_start + n_k, dtype=np.int32)
 
-        # 7. 重建 _nodes_by_level
-        self._rebuild_nodes_from_layers_data()
-
-    def _rebuild_nodes_from_layers_data(self):
+    def _rebuild_nodes_from_layers_data(self, level: int) -> List[_Node]:
         """
-        CN: 从 layers_data 重建 _nodes_by_level (bucket 模式)。
-        EN: Rebuild _nodes_by_level from layers_data (bucket mode).
+        CN: 从 layers_data 懒重建指定层的 _Node 列表，并缓存到 _nodes_by_level。
+        EN: Lazily rebuild the _Node list for one level from layers_data and cache it in _nodes_by_level.
         """
-        K = self._build_root_level
+        if level not in self.layers_data:
+            return []
+        if level < len(self._nodes_by_level) and self._nodes_by_level[level]:
+            return self._nodes_by_level[level]
 
-        for l in range(1, K + 1):
-            if l not in self.layers_data:
-                continue
+        data = self.layers_data[level]
+        meta = data['meta']
+        bbox = data['bbox']
+        n_nodes = len(meta)
 
-            data = self.layers_data[l]
-            meta = data['meta']
-            bbox = data['bbox']
-            n_nodes = len(meta)
+        offset = self.layer_offsets.get(level, 0)
+        nodes: List[_Node] = []
 
-            offset = self.layer_offsets.get(l, 0)
-            nodes = []
+        for i in range(n_nodes):
+            node_level = int(meta[i, 0])
+            parent_idx = int(meta[i, 1])
+            public_idx = int(meta[i, 2])
+            global_idx = offset + i
 
-            for i in range(n_nodes):
-                node_level = int(meta[i, 0])
-                parent_idx = int(meta[i, 1])
-                public_idx = int(meta[i, 2])
-                global_idx = offset + i
+            node = _Node(
+                level=node_level,
+                bbox=bbox[i],
+                parent_node_index=parent_idx,
+                global_node_index=global_idx,
+                public_idx=public_idx,
+            )
+            node.center = 0.5 * (bbox[i, 0, :] + bbox[i, 1, :])
+            node.radius = np.sqrt(np.sum((bbox[i, 1, :] - node.center) ** 2))
 
-                node = _Node(
-                    level=node_level,
-                    bbox=bbox[i],
-                    parent_node_index=parent_idx,
-                    global_node_index=global_idx,
-                    public_idx=public_idx,
-                )
-                node.center = 0.5 * (bbox[i, 0, :] + bbox[i, 1, :])
-                node.radius = np.sqrt(np.sum((bbox[i, 1, :] - node.center) ** 2))
+            if level == 1:
+                start, end = int(meta[i, 3]), int(meta[i, 4])
+                node.point_indices = self._permuted_point_indices[start:end]
+                node.is_leaf = True
 
-                if l == 1:
-                    start, end = int(meta[i, 3]), int(meta[i, 4])
-                    node.point_indices = self._permuted_point_indices[start:end]
-                    node.is_leaf = True
+            nodes.append(node)
 
-                nodes.append(node)
-
-            if l < len(self._nodes_by_level):
-                self._nodes_by_level[l] = nodes
+        if level < len(self._nodes_by_level):
+            self._nodes_by_level[level] = nodes
+        return nodes
 
     # =========================================================================
     # CSR 计算和 K-NN
@@ -1306,7 +1374,17 @@ class TreeHierarchy(BaseHierarchy):
         CN: 计算每层节点的 K-NN。
         EN: Compute K-Nearest-Neighbors for each level's nodes.
         """
-        for level_idx, level in enumerate(self.levels):
+        n_levels_public = len(self.levels)
+        if n_levels_public == 0:
+            return
+
+        # HALO 默认不为最粗层计算 kNN；先显式置空，避免把无意义的根层查询算进 trace。
+        coarsest_level = self.levels[-1]
+        n_coarsest = len(coarsest_level.points)
+        coarsest_level.knn_indices = np.empty((n_coarsest, 0), dtype=np.int32)
+
+        for level_idx in range(max(n_levels_public - 1, 0)):
+            level = self.levels[level_idx]
             nodes = level.points
             n_nodes = len(nodes)
 
@@ -1315,9 +1393,12 @@ class TreeHierarchy(BaseHierarchy):
                 continue
 
             k = min(self.k_neighbors + 1, n_nodes)
+            workers = int(self.knn_workers)
+            if workers == 0:
+                workers = 1
 
             tree = cKDTree(nodes, compact_nodes=False, balanced_tree=False)
-            _, indices = tree.query(nodes, k=k, workers=-1)
+            _, indices = tree.query(nodes, k=k, workers=workers)
 
             if k > 1:
                 knn = indices[:, 1:].astype(np.int32)
@@ -1381,6 +1462,26 @@ class TreeHierarchy(BaseHierarchy):
         EN: Flatten tree structure into arrays for Numba acceleration.
         在 build() 之后调用，若使用 shielding 则必须调用此方法。
         """
+        # bucket 模式在 build() 阶段已经生成可直接供 tree search 使用的 flat arrays，
+        # 不需要再通过 _nodes_by_level 重新拍平。
+        if (
+            hasattr(self, "layers_data")
+            and self.layers_data
+            and hasattr(self, "flat_centers")
+            and getattr(self, "flat_centers", None) is not None
+            and hasattr(self, "flat_radii")
+            and hasattr(self, "flat_levels")
+            and hasattr(self, "flat_is_leaf")
+            and hasattr(self, "flat_public_idx")
+            and hasattr(self, "flat_child_ptr")
+            and hasattr(self, "flat_child_indices")
+            and hasattr(self, "flat_leaf_point_ptr")
+            and hasattr(self, "flat_leaf_points")
+            and hasattr(self, "flat_root_indices")
+            and len(self.flat_centers) > 0
+        ):
+            return
+
         # 基于当前可见层（可能已截断）而非原始 build 深度来构建扁平树
         available_levels = [
             lvl

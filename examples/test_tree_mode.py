@@ -76,7 +76,7 @@ def main() -> None:
         cost_type="l2^2",
         solver_engine=str(args.solver_engine),
         max_inner_iter=4,
-        tolerance={"objective": 1e-5, "primal": 1e-5, "dual": 1e-5},
+        tolerance={"objective": 1e-6, "primal": 1e-6, "dual": 1e-6},
         target_coarse_size=64,
         enable_profiling=False,
         printing={"enabled": False},
